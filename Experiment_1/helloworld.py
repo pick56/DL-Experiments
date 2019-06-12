@@ -19,7 +19,19 @@ WORK_DIRECTORY = 'data'
 IMAGE_SIZE = 28
 NUM_CHANNELS = 1
 PIXEL_DEPTH = 255
+NUM_LABELS = 10
 VALIDATION_SIZE = 500  # Size of the validation set.
+SEED = 66478  # Set to None for random seed.
+BATCH_SIZE = 64
+NUM_EPOCHS = 10
+EVAL_BATCH_SIZE = 64
+EVAL_FREQUENCY = 100  # Number of steps between evaluations.
+
+
+def data_type():
+  """Return the type of the activations, weights, and placeholder variables."""
+  return tf.float32
+
 
 def maybe_download(filename):
   """
@@ -63,6 +75,28 @@ def extract_labels(filename, num_images):
     buf = bytestream.read(1 * num_images)
     labels = numpy.frombuffer(buf, dtype=numpy.uint8).astype(numpy.int64)
   return labels
+
+
+def fake_data(num_images):
+  """
+  Generate a fake dataset that matches the dimensions of MNIST.
+  生成假数据
+  """
+  data = numpy.ndarray(shape=(num_images, IMAGE_SIZE, IMAGE_SIZE, NUM_CHANNELS), dtype=numpy.float32)
+  labels = numpy.zeros(shape=(num_images,), dtype=numpy.int64)
+  for image in xrange(num_images):
+    label = image % 2
+    data[image, :, :, 0] = label - 0.5
+    labels[image] = label
+  return data, labels
+
+
+def error_rate(predictions, labels):
+  """
+  Return the error rate based on dense predictions and sparse labels.
+  预测和groundtruth之间的误差
+  """
+  return 100.0 - (100.0 * numpy.sum(numpy.argmax(predictions, 1) == labels) / predictions.shape[0])
 
 
 if __name__ == '__main__':
@@ -116,7 +150,103 @@ if __name__ == '__main__':
     fc2_weights = tf.Variable(tf.truncated_normal([512, NUM_LABELS], stddev=0.1, seed=SEED, dtype=data_type()))
     fc2_biases = tf.Variable(tf.constant(0.1, shape=[NUM_LABELS], dtype=data_type()))
 
+    # 定义模型
+    def model(data, train=False):
+        """模型定义"""
+        # 2D 卷积使用same模式，得到的feature map和输入有相同的大小
+        # strides是一个4D array格式为[image index, y, x, depth].
+        conv = tf.nn.conv2d(data, conv1_weights, strides=[1, 1, 1, 1], padding='SAME')
+        # Bias and rectified linear non-linearity.
+        relu = tf.nn.relu(tf.nn.bias_add(conv, conv1_biases))
+        # 最大池化
+        pool = tf.nn.max_pool(relu, ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding='SAME')
+        conv = tf.nn.conv2d(pool, conv2_weights, strides=[1, 1, 1, 1], padding='SAME')
+        relu = tf.nn.relu(tf.nn.bias_add(conv, conv2_biases))
+        pool = tf.nn.max_pool(relu,ksize=[1, 2, 2, 1], strides=[1, 2, 2, 1], padding='SAME')
+        # Reshape the feature map 变成 2D matrix 以便后面进行全连接
+        pool_shape = pool.get_shape().as_list()
+        reshape = tf.reshape(pool, [pool_shape[0], pool_shape[1] * pool_shape[2] * pool_shape[3]])
+        # 全连接层
+        hidden = tf.nn.relu(tf.matmul(reshape, fc1_weights) + fc1_biases)
+        # 训练的时候增加50%的dropout比例。测试和验证的时候不需要进行这一步操作
+        if train:
+            hidden = tf.nn.dropout(hidden, 0.5, seed=SEED)
+        return tf.matmul(hidden, fc2_weights) + fc2_biases
 
+    # 训练模型定义
+    logits = model(train_data_node, True)
+    # 定义模型loss
+    loss = tf.reduce_mean(tf.nn.sparse_softmax_cross_entropy_with_logits(labels=train_labels_node, logits=logits))
+    # 定义正则化项，和loss加在一起，这个正则化项只在训练的时候有用
+    regularizers = (tf.nn.l2_loss(fc1_weights) + tf.nn.l2_loss(fc1_biases) + tf.nn.l2_loss(fc2_weights) + tf.nn.l2_loss(fc2_biases))
+    loss += 5e-4 * regularizers
 
+    # 因为训练的时候需要我们不断的减少学习rate
+    batch = tf.Variable(0, dtype=data_type())
+    learning_rate = tf.train.exponential_decay(
+        0.01,                # Base learning rate.
+        batch * BATCH_SIZE,  # Current index into the dataset.
+        train_size,          # Decay step.
+        0.95,                # Decay rate.
+        staircase=True)
+    # 使用MomentumOptimizer
+    optimizer = tf.train.MomentumOptimizer(learning_rate, 0.9).minimize(loss, global_step=batch)
 
+    # 预测当前一个小的batch的结果Predictions for the current training minibatch.
+    train_prediction = tf.nn.softmax(logits)
+
+    # 预测测试和验证集的结果，Predictions for the test and validation, which we'll compute less often.
+    eval_prediction = tf.nn.softmax(model(eval_data))
+
+    # 每个batches进行评价，eval_data给验证数据eval_predictions获得预测结果
+    def eval_in_batches(data, sess):
+        """Get all predictions for a dataset by running it in small batches."""
+        size = data.shape[0]
+        if size < EVAL_BATCH_SIZE:
+            raise ValueError("batch size for evals larger than dataset: %d" % size)
+        predictions = numpy.ndarray(shape=(size, NUM_LABELS), dtype=numpy.float32)
+        # 截取验证集的一部分，用来获取模型效果
+        for begin in xrange(0, size, EVAL_BATCH_SIZE):
+            end = begin + EVAL_BATCH_SIZE
+            # 确定数据足够
+            if end <= size:
+                predictions[begin:end, :] = sess.run(eval_prediction, feed_dict={eval_data: data[begin:end, ...]})
+            # 如果数据不恰好够。倒着取一个batch_size
+            else:
+                batch_predictions = sess.run(eval_prediction, feed_dict={eval_data: data[-EVAL_BATCH_SIZE:, ...]})
+                predictions[begin:, :] = batch_predictions[begin - size:, :]
+        return predictions
+
+    # 创建一个会话训练模型
+    start_time = time.time()
+    with tf.Session() as sess:
+        # 随机数初始化变量
+        tf.global_variables_initializer().run()
+        print('Initialized!')
+        # 训练步骤，//表示向下取整除法,10*数据量 // 64
+        for step in xrange(int(num_epochs * train_size) // BATCH_SIZE):
+            # 计算数据中当前小批量的偏移量。
+            # 请注意，我们可以跨epoche使用更好的随机化。
+            offset = (step * BATCH_SIZE) % (train_size - BATCH_SIZE)
+            batch_data = train_data[offset:(offset + BATCH_SIZE), ...]
+            batch_labels = train_labels[offset:(offset + BATCH_SIZE)]
+
+            # 这个字典用来传给模型的feed_dict
+            feed_dict = {train_data_node: batch_data, train_labels_node: batch_labels}
+            # 使用optimizer更新权重
+            sess.run(optimizer, feed_dict=feed_dict)
+            # 每100步进行一次验证
+            if step % EVAL_FREQUENCY == 0:
+                # fetch some extra nodes' data
+                l, lr, predictions = sess.run([loss, learning_rate, train_prediction], feed_dict=feed_dict)
+                elapsed_time = time.time() - start_time
+                start_time = time.time()
+                print('Step %d (epoch %.2f), %.1f ms' % (step, float(step) * BATCH_SIZE / train_size, 1000 * elapsed_time / EVAL_FREQUENCY))
+                print('Minibatch loss: %.3f, learning rate: %.6f' % (l, lr))
+                print('Minibatch error: %.1f%%' % error_rate(predictions, batch_labels))
+                print('Validation error: %.1f%%' % error_rate(eval_in_batches(validation_data, sess), validation_labels))
+                sys.stdout.flush()
+        # Finally print the result!
+        test_error = error_rate(eval_in_batches(test_data, sess), test_labels)
+        print('Test error: %.1f%%' % test_error)
 
