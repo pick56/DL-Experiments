@@ -61,11 +61,16 @@ def data_type():
 
 
 def maybe_download(filename):
-  """Download the data from Yann's website, unless it's already here."""
+  """
+  远程下载数据,除非数据已经存在
+  """
+  # 若目录不存在创建目录
   if not tf.gfile.Exists(WORK_DIRECTORY):
     tf.gfile.MakeDirs(WORK_DIRECTORY)
   filepath = os.path.join(WORK_DIRECTORY, filename)
+  # 若数据文件不存在,下载数据
   if not tf.gfile.Exists(filepath):
+    # SOURCE_URL = 'http://yann.lecun.com/exdb/mnist/'
     filepath, _ = urllib.request.urlretrieve(SOURCE_URL + filename, filepath)
     with tf.gfile.GFile(filepath) as f:
       size = f.size()
@@ -341,8 +346,8 @@ if __name__ == '__main__':
   FLAGS, unparsed = parser.parse_known_args()
   # FLAGS 为命名空间
   # unparsed 为未解析的参数
-  print(FLAGS)
-  print(unparsed)
+  # print(FLAGS)
+  # print(unparsed)
 
   # 运行函数main，参数为argv列表
   tf.app.run(main=main, argv=[sys.argv[0]] + unparsed)
